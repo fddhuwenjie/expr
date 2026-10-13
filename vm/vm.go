@@ -3,6 +3,7 @@ package vm
 //go:generate sh -c "go run ./func_types > ./func_types[generated].go"
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -49,11 +50,34 @@ type VM struct {
 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
 	scopePoolIdx int     // Current index into scopePool for allocation
 	currScope    *Scope  // Cached pointer to the current scope (optimization)
+	sess         *observeSession
+	obsLayer     int // 当前事件所属的调用层；仅在被观察的运行期间有效
 }
 
-func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+func (vm *VM) Run(program *Program, env any) (any, error) {
+	return vm.runSession(program, env, nil, 0)
+}
+
+// runSession 是所有执行入口共用的运行主体。sess 为 nil 表示普通执行（保持既
+// 有行为）；非 nil 表示一次被观察的运行。layer 为本次运行的初始调用层，顶层
+// 运行为 0，RunNested 进入的子程序逐层加一。
+func (vm *VM) runSession(program *Program, env any, sess *observeSession, layer int) (_ any, err error) {
+	// 观察会话已经终止时（例如嵌套运行的观察函数此前返回了错误），不再执行
+	// 任何指令，也不产生任何事件，直接原样返回终止错误。
+	if sess != nil && sess.stop != nil {
+		return nil, sess.stop
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
+			// 观察函数主动终止产生的错误即使穿过 Go 函数调用边界以 panic
+			// 形式回到当前虚拟机，也必须原样透传，不能包装成 file.Error。
+			if sess != nil && sess.stop != nil {
+				if e, ok := r.(error); ok && errors.Is(e, sess.stop) {
+					err = sess.stop
+					return
+				}
+			}
 			var location file.Location
 			if vm.ip-1 < len(program.locations) {
 				location = program.locations[vm.ip-1]
@@ -68,6 +92,14 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			err = f.Bind(program.source)
 		}
 	}()
+	// 运行结束后清理观察会话，避免同一虚拟机复用时看到上一次运行的状态。
+	defer func() {
+		vm.sess = nil
+		vm.obsLayer = 0
+	}()
+
+	vm.sess = sess
+	vm.obsLayer = layer
 
 	if vm.Stack == nil {
 		vm.Stack = make([]any, 0, 2)
@@ -92,13 +124,15 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 
 	var fnArgsBuf []any
 
+runLoop:
 	for vm.ip < len(program.Bytecode) {
 		if debug && vm.debug {
 			<-vm.step
 		}
 
-		op := program.Bytecode[vm.ip]
-		arg := program.Arguments[vm.ip]
+		ip := vm.ip
+		op := program.Bytecode[ip]
+		arg := program.Arguments[ip]
 		vm.ip += 1
 
 		switch op {
@@ -650,6 +684,28 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			panic(fmt.Sprintf("unknown bytecode %#x", op))
 		}
 
+		// 事件在指令成功执行之后产生：只有真实执行过的指令才会被观察到，
+		// 因此短路被跳过的分支、安全调用被跳过的链路段以及执行失败的指令
+		// 本身都不会产生事件。
+		if sess != nil {
+			var location file.Location
+			if ip < len(program.locations) {
+				location = program.locations[ip]
+			}
+			if observeErr := sess.emit(Event{
+				Layer:      vm.obsLayer,
+				IP:         ip,
+				Opcode:     op,
+				Argument:   arg,
+				Location:   location,
+				StackDepth: len(vm.Stack),
+			}); observeErr != nil {
+				// 观察函数要求终止：立即停止执行后续指令并原样返回该错误。
+				err = observeErr
+				break runLoop
+			}
+		}
+
 		if debug && vm.debug {
 			vm.curr <- vm.ip
 		}
@@ -658,6 +714,10 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 	if debug && vm.debug {
 		close(vm.curr)
 		close(vm.step)
+	}
+
+	if err != nil {
+		return nil, err
 	}
 
 	if len(vm.Stack) > 0 {

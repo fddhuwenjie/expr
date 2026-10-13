@@ -265,6 +265,20 @@ func Run(program *vm.Program, env any) (any, error) {
 	return vm.Run(program, env)
 }
 
+// RunObserve 运行字节码程序，并通过 observer 按指令真实执行顺序交付不可变的
+// vm.Event。事件至少包含连续序号、执行的指令及参数、对应源位置、当前栈深度
+// 和调用层标识。
+//
+// observer 返回非 nil 错误时本次运行立即终止，并且该错误会被原样作为返回值
+// （不会包装成源位置错误）；程序自身的运行时错误仍按既有行为返回绑定源位置
+// 的 *file.Error。observer 为 nil 时等价于 Run。
+//
+// 同一程序可以被并发地重复运行，每次运行的事件序号、调用层等状态相互独立；
+// 未使用本入口的 Run、Eval 等既有 API 的返回值、错误类型与错误顺序保持不变。
+func RunObserve(program *vm.Program, env any, observer vm.Observer) (any, error) {
+	return vm.RunObserve(program, env, observer)
+}
+
 // Eval parses, compiles and runs given input.
 func Eval(input string, env any) (any, error) {
 	if _, ok := env.(Option); ok {
