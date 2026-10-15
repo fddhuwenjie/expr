@@ -941,6 +941,31 @@ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
 		}
 		return v.error(node.Arguments[1], "predicate should has two input and one output param")
 
+	case "try":
+		if len(node.Arguments) != 2 {
+			return v.error(node, "invalid number of arguments (expected 2, got %d)", len(node.Arguments))
+		}
+
+		// Both arguments are checked in the current variable and
+		// predicate scope, as the fallback expression is evaluated
+		// in the very same context as the primary one.
+		primary := v.visit(node.Arguments[0])
+		fallback := v.visit(node.Arguments[1])
+
+		if primary.Nil && !fallback.Nil {
+			return fallback
+		}
+		if !primary.Nil && fallback.Nil {
+			return primary
+		}
+		if primary.Nil && fallback.Nil {
+			return v.config.NtCache.NatureOf(nil)
+		}
+		if fallback.AssignableTo(primary) {
+			return primary
+		}
+		return Nature{}
+
 	}
 
 	if id, ok := builtin.Index[node.Name]; ok {

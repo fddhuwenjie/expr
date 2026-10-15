@@ -183,6 +183,22 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
+			`try(1, 2)`,
+			vm.Program{
+				Constants: []any{
+					1,
+					2,
+				},
+				Bytecode: []vm.Opcode{
+					vm.OpTryBegin,
+					vm.OpPush,
+					vm.OpTryJump,
+					vm.OpPush,
+				},
+				Arguments: []int{2, 0, 1, 1},
+			},
+		},
+		{
 			`A?.B.C.D`,
 			vm.Program{
 				Constants: []any{

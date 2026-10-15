@@ -2179,6 +2179,293 @@ func TestRun_NilCoalescingOperator(t *testing.T) {
 	})
 }
 
+func TestTry(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		env  any
+		want any
+	}{
+		{
+			"returns primary result",
+			`try(1, 2)`,
+			nil,
+			1,
+		},
+		{
+			"returns primary result from env",
+			`try(foo, 42)`,
+			map[string]any{"foo": 7},
+			7,
+		},
+		{
+			"returns nil primary result as nil, not fallback",
+			`try(maybeNil(), 42)`,
+			map[string]any{"maybeNil": func() any { return nil }},
+			nil,
+		},
+		{
+			"evaluates fallback on missing field",
+			`try(foo.bar, 42)`,
+			map[string]any{},
+			42,
+		},
+		{
+			"evaluates fallback on runtime error",
+			`try(foo % 0, 42)`,
+			map[string]any{"foo": 1},
+			42,
+		},
+		{
+			"evaluates fallback on user function error",
+			`try(boom(), "ok")`,
+			map[string]any{"boom": func() (any, error) { return nil, fmt.Errorf("boom") }},
+			"ok",
+		},
+		{
+			"fallback is evaluated in original variable context",
+			`try(foo.bar, baz)`,
+			map[string]any{"baz": 9},
+			9,
+		},
+		{
+			"nil primary result keeps working with nil coalescing",
+			`try(foo.bar, nil) ?? 5`,
+			map[string]any{},
+			5,
+		},
+		{
+			"optional chain primary returns nil",
+			`try(foo?.bar.baz, 1)`,
+			map[string]any{},
+			nil,
+		},
+		{
+			"nested try uses inner fallback",
+			`try(try(foo.a, foo.b), 3)`,
+			map[string]any{},
+			3,
+		},
+		{
+			"nested try with failing inner fallback uses outer fallback",
+			`try(try(foo.a, bar % 0), 3)`,
+			map[string]any{"bar": 1},
+			3,
+		},
+		{
+			"nested try with successful inner primary",
+			`try(try(1, 2), 3)`,
+			nil,
+			1,
+		},
+		{
+			"fallback has access to predicate element",
+			`map(1..3, try(# % 0, -#))`,
+			nil,
+			[]any{-1, -2, -3},
+		},
+		{
+			"fallback has access to predicate index",
+			`map([10, 20], try(# % 0, #index))`,
+			nil,
+			[]any{0, 1},
+		},
+		{
+			"fallback has access to reduce accumulator",
+			`reduce(1..3, try(#acc + # % 0, #acc + 100), 0)`,
+			nil,
+			300,
+		},
+		{
+			"failed predicate inside primary does not leak scopes",
+			`[try(filter(1..5, {# % 0 == 0}), 99), map(1..3, {# * 2})]`,
+			nil,
+			[]any{99, []any{2, 4, 6}},
+		},
+		{
+			"failed primary does not leak variables",
+			`let x = try(foo % 0, 5); x * 2`,
+			map[string]any{"foo": 1},
+			10,
+		},
+		{
+			"fallback sees outer let variables",
+			`let x = 10; try(foo % 0, x)`,
+			map[string]any{"foo": 1},
+			10,
+		},
+		{
+			"fallback sees outer let variables inside predicate",
+			`let d = 7; map(1..3, try(# % 0, # + d))`,
+			nil,
+			[]any{8, 9, 10},
+		},
+		{
+			"works through pipe",
+			`1 | try(2)`,
+			nil,
+			1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			program, err := expr.Compile(tt.code)
+			require.NoError(t, err)
+
+			got, err := expr.Run(program, tt.env)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("primary is evaluated only once", func(t *testing.T) {
+		calls := 0
+		env := map[string]any{
+			"boom": func() (any, error) {
+				calls++
+				return nil, fmt.Errorf("boom")
+			},
+		}
+		program, err := expr.Compile(`try(boom(), 1)`, expr.Env(env))
+		require.NoError(t, err)
+
+		for i := 0; i < 5; i++ {
+			out, err := expr.Run(program, env)
+			require.NoError(t, err)
+			assert.Equal(t, 1, out)
+		}
+		assert.Equal(t, 5, calls)
+	})
+
+	t.Run("fallback error carries fallback location", func(t *testing.T) {
+		program, err := expr.Compile(`try(foo.x, bar % 0)`)
+		require.NoError(t, err)
+
+		_, err = expr.Run(program, map[string]any{"bar": 1})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "integer divide by zero")
+
+		var fileErr *file.Error
+		require.ErrorAs(t, err, &fileErr)
+		assert.Equal(t, 1, fileErr.Line)
+		// The location must point inside the fallback, not the primary.
+		assert.Greater(t, fileErr.Column, strings.Index(`try(foo.x, bar % 0`, ","))
+	})
+
+	t.Run("constant primary failure stays a compile error", func(t *testing.T) {
+		_, err := expr.Compile(`try(1 % 0, 1)`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "integer divide by zero")
+	})
+
+	t.Run("type mismatch in primary stays a compile error", func(t *testing.T) {
+		_, err := expr.Compile(`try("a" + 1, 2)`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mismatched types string and int")
+	})
+
+	t.Run("wrong number of arguments is rejected at compile time", func(t *testing.T) {
+		for _, code := range []string{`try()`, `try(1)`, `try(1, 2, 3)`} {
+			_, err := expr.Compile(code)
+			require.Error(t, err, code)
+			assert.Contains(t, err.Error(), "invalid number of arguments (expected 2", code)
+		}
+	})
+
+	t.Run("explicitly registered function overrides builtin", func(t *testing.T) {
+		program, err := expr.Compile(`try(1)`,
+			expr.Function("try", func(args ...any) (any, error) {
+				return 99, nil
+			}, new(func(int) int)),
+		)
+		require.NoError(t, err)
+
+		out, err := expr.Run(program, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 99, out)
+	})
+
+	t.Run("environment function overrides builtin", func(t *testing.T) {
+		env := map[string]any{
+			"try": func() int { return 42 },
+		}
+		program, err := expr.Compile(`try()`, expr.Env(env))
+		require.NoError(t, err)
+
+		out, err := expr.Run(program, env)
+		require.NoError(t, err)
+		assert.Equal(t, 42, out)
+	})
+
+	t.Run("memory budget exceeded is not caught", func(t *testing.T) {
+		program, err := expr.Compile(`try(1..10000000, 0)`)
+		require.NoError(t, err)
+
+		_, err = new(vm.VM).Run(program, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "memory budget exceeded")
+	})
+
+	t.Run("memory budget exceeded in nested try is not caught", func(t *testing.T) {
+		program, err := expr.Compile(`try(try(1..10000000, 1), 2)`)
+		require.NoError(t, err)
+
+		_, err = new(vm.VM).Run(program, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "memory budget exceeded")
+	})
+
+	t.Run("failed primary memory accounting is rolled back", func(t *testing.T) {
+		program, err := expr.Compile(`try(len(1..100000) + foo % 0, 0) + len(1..950000)`)
+		require.NoError(t, err)
+
+		out, err := expr.Run(program, map[string]any{"foo": 1})
+		require.NoError(t, err)
+		assert.Equal(t, 950000, out)
+	})
+
+	t.Run("reused VM keeps no state from failed primary", func(t *testing.T) {
+		program, err := expr.Compile(`map(1..100, {try(# % 0, -#)})`)
+		require.NoError(t, err)
+
+		runner := new(vm.VM)
+		for i := 0; i < 50; i++ {
+			out, err := runner.Run(program, nil)
+			require.NoError(t, err)
+			arr, ok := out.([]any)
+			require.True(t, ok)
+			require.Len(t, arr, 100)
+			assert.Equal(t, -1, arr[0])
+			assert.Equal(t, -100, arr[99])
+		}
+	})
+
+	t.Run("same compiled program runs concurrently", func(t *testing.T) {
+		env := map[string]any{
+			"vals": []any{nil, 2, nil, 4},
+		}
+		program, err := expr.Compile(`map(vals, {try(# * 2, -1)})`, expr.Env(env))
+		require.NoError(t, err)
+
+		want := []any{-1, 4, -1, 8}
+
+		var wg sync.WaitGroup
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					out, err := expr.Run(program, env)
+					assert.NoError(t, err)
+					assert.Equal(t, want, out)
+				}
+			}()
+		}
+		wg.Wait()
+	})
+}
+
 func TestEval_nil_in_maps(t *testing.T) {
 	env := map[string]any{
 		"m":     map[any]any{nil: "bar"},

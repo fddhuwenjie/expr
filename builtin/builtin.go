@@ -644,6 +644,14 @@ var Builtins = []*Function{
 		Func: get,
 	},
 	{
+		// try is a special form with lazily evaluated arguments.
+		// It is handled directly by the checker, compiler and VM
+		// (OpTryBegin/OpTryJump), so no callable implementation
+		// (Func/Fast/Safe) is provided here.
+		Name:  "try",
+		Types: types(new(func(any, any) any)),
+	},
+	{
 		Name: "take",
 		Func: func(args ...any) (any, error) {
 			if len(args) != 2 {

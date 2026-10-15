@@ -86,5 +86,7 @@ const (
 	OpBegin
 	OpAnd
 	OpOr
+	OpTryBegin
+	OpTryJump
 	OpEnd // This opcode must be at the end of this list.
 )

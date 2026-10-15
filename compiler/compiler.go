@@ -1145,6 +1145,21 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 		c.emit(OpEnd)
 		return
 
+	case "try":
+		// OpTryBegin snapshots the VM state and protects evaluation
+		// of the primary expression. On a runtime panic the VM
+		// restores the snapshot and continues at the fallback code;
+		// OpTryJump is reached only when the primary succeeded.
+		begin := c.emit(OpTryBegin, placeholder)
+		c.compile(node.Arguments[0])
+		c.derefInNeeded(node.Arguments[0])
+		end := c.emit(OpTryJump, placeholder)
+		c.patchJump(begin)
+		c.compile(node.Arguments[1])
+		c.derefInNeeded(node.Arguments[1])
+		c.patchJump(end)
+		return
+
 	}
 
 	if id, ok := builtin.Index[node.Name]; ok {
